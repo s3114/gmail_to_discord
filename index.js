@@ -38,6 +38,20 @@ oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
 const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 let hasSentAuthErrorNotification = false;
 
+function formatError(err) {
+  const parts = [];
+
+  if (err?.message) parts.push(err.message);
+  if (err?.code) parts.push(`code=${err.code}`);
+  if (err?.cause?.message) parts.push(`cause=${err.cause.message}`);
+  if (err?.cause?.code) parts.push(`causeCode=${err.cause.code}`);
+  if (err?.cause?.errno) parts.push(`causeErrno=${err.cause.errno}`);
+  if (err?.cause?.syscall) parts.push(`causeSyscall=${err.cause.syscall}`);
+  if (err?.cause?.hostname) parts.push(`causeHostname=${err.cause.hostname}`);
+
+  return parts.length > 0 ? parts.join(" | ") : String(err);
+}
+
 function decodeBase64Url(input) {
   if (!input) return "";
   const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
@@ -70,11 +84,17 @@ function truncateForDiscord(text, max = 1500) {
 }
 
 async function sendDiscordWebhook(content) {
-  const res = await fetch(DISCORD_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
+  let res;
+
+  try {
+    res = await fetch(DISCORD_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+  } catch (err) {
+    throw new Error(`Discord webhook fetch failed: ${formatError(err)}`);
+  }
 
   if (!res.ok) {
     const body = await res.text();
@@ -128,6 +148,8 @@ async function processUnreadMessages() {
 
   for (const msg of messages) {
     try {
+      console.log(`Processing message: ${msg.id}`);
+
       const detailRes = await gmail.users.messages.get({
         userId: GOOGLE_USER_ID,
         id: msg.id,
@@ -156,6 +178,7 @@ async function processUnreadMessages() {
       ].join("\n");
 
       await sendDiscordWebhook(content);
+      console.log(`Discord notified: ${msg.id}`);
 
       await gmail.users.messages.modify({
         userId: GOOGLE_USER_ID,
@@ -167,7 +190,7 @@ async function processUnreadMessages() {
 
       console.log(`Notified and marked as read: ${msg.id}`);
     } catch (err) {
-      console.error(`Failed to process message ${msg.id}:`, err.message);
+      console.error(`Failed to process message ${msg.id}: ${formatError(err)}`);
     }
   }
 }
