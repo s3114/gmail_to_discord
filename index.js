@@ -136,6 +136,12 @@ function buildAvatarUrlFromEmail(email) {
   return `https://www.gravatar.com/avatar/${hash}?d=identicon&s=128`;
 }
 
+function buildDiscordUsername(fromInfo) {
+  const name = (fromInfo?.displayName || "Mail").trim();
+  const email = (fromInfo?.email || "").trim();
+  return email ? `${name}<${email}>` : name;
+}
+
 function isInvalidGrantError(err) {
   const errText = String(err?.message ?? "");
   const causeText = String(err?.cause?.message ?? "");
@@ -192,9 +198,9 @@ async function processUnreadMessages() {
 
       const detail = detailRes.data;
       const headers = detail.payload?.headers ?? [];
-      const subject =
-        headers.find((h) => h.name?.toLowerCase() === "subject")?.value ??
-        "(No Subject)";
+      const subjectHeader =
+        headers.find((h) => h.name?.toLowerCase() === "subject")?.value ?? "";
+      const subject = subjectHeader.trim() || "no title";
       const from =
         headers.find((h) => h.name?.toLowerCase() === "from")?.value ??
         "(Unknown Sender)";
@@ -209,7 +215,7 @@ async function processUnreadMessages() {
       ].join("\n");
 
       await sendDiscordWebhook({
-        username: truncate(fromInfo.displayName || "Mail", 80),
+        username: truncate(buildDiscordUsername(fromInfo), 80),
         avatar_url: buildAvatarUrlFromEmail(fromInfo.email),
         content,
       });
