@@ -1,5 +1,7 @@
 import dotenv from "dotenv";
 import { google } from "googleapis";
+import crypto from "node:crypto";
+import process from "node:process";
 
 dotenv.config();
 
@@ -37,6 +39,7 @@ oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
 
 const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 let hasSentAuthErrorNotification = false;
+let isPolling = false;
 
 function formatError(err) {
   const parts = [];
@@ -83,14 +86,18 @@ function truncateForDiscord(text, max = 1500) {
     : normalized;
 }
 
-async function sendDiscordWebhook(content) {
+async function sendDiscordWebhook(contentOrPayload) {
+  const payload =
+    typeof contentOrPayload === "string"
+      ? { content: contentOrPayload }
+      : contentOrPayload;
   let res;
 
   try {
     res = await fetch(DISCORD_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(payload),
     });
   } catch (err) {
     throw new Error(`Discord webhook fetch failed: ${formatError(err)}`);
@@ -100,6 +107,33 @@ async function sendDiscordWebhook(content) {
     const body = await res.text();
     throw new Error(`Discord webhook failed: ${res.status} ${body}`);
   }
+}
+
+function truncate(text, max = 80) {
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function parseFromHeader(fromHeader) {
+  if (!fromHeader) return { displayName: "", email: "" };
+  const match = fromHeader.match(/^(.*?)(?:\s*<([^>]+)>)?$/);
+  const rawName = (match?.[1] ?? "").trim().replace(/^"|"$/g, "");
+  const email = (match?.[2] ?? "").trim();
+
+  if (email) {
+    return { displayName: rawName || email, email };
+  }
+
+  return { displayName: fromHeader.trim(), email: "" };
+}
+
+function buildAvatarUrlFromEmail(email) {
+  if (!email) return undefined;
+  const hash = crypto
+    .createHash("md5")
+    .update(email.trim().toLowerCase())
+    .digest("hex");
+  return `https://www.gravatar.com/avatar/${hash}?d=identicon&s=128`;
 }
 
 function isInvalidGrantError(err) {
@@ -166,18 +200,19 @@ async function processUnreadMessages() {
         "(Unknown Sender)";
       const plainBody = extractPlainBody(detail.payload);
       const excerpt = truncateForDiscord(plainBody, 1200);
+      const fromInfo = parseFromHeader(from);
 
       const content = [
-        "📩 **新着メール**",
-        `**From**: ${from}`,
-        `**Subject**: ${subject}`,
+        `## ${subject}`,
         "",
-        "```",
         excerpt,
-        "```",
       ].join("\n");
 
-      await sendDiscordWebhook(content);
+      await sendDiscordWebhook({
+        username: truncate(fromInfo.displayName || "Mail", 80),
+        avatar_url: buildAvatarUrlFromEmail(fromInfo.email),
+        content,
+      });
       console.log(`Discord notified: ${msg.id}`);
 
       await gmail.users.messages.modify({
@@ -208,13 +243,21 @@ async function main() {
   await processUnreadMessages();
 
   setInterval(async () => {
+    if (isPolling) {
+      console.log("Previous poll is still running. Skipping this tick.");
+      return;
+    }
+
+    isPolling = true;
     try {
       await processUnreadMessages();
     } catch (err) {
       if (isInvalidGrantError(err)) {
         await notifyOAuthReauthNeededOnce(err);
       }
-      throw err;
+      console.error("Polling error:", formatError(err));
+    } finally {
+      isPolling = false;
     }
   }, intervalMs);
 
