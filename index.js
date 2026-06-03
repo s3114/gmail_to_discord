@@ -6,40 +6,115 @@ import process from "node:process";
 dotenv.config();
 
 const {
-  DISCORD_WEBHOOK_URL,
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET,
-  GOOGLE_REFRESH_TOKEN,
-  GOOGLE_USER_ID = "me",
-  GMAIL_QUERY = "is:unread newer_than:10m",
   POLL_INTERVAL_SECONDS = "10",
   POLL_INTERVAL_MINUTES,
 } = process.env;
 
-const requiredEnv = [
-  "DISCORD_WEBHOOK_URL",
-  "GOOGLE_CLIENT_ID",
-  "GOOGLE_CLIENT_SECRET",
-  "GOOGLE_REFRESH_TOKEN",
-];
+let isPolling = false;
 
-const missingEnv = requiredEnv.filter((key) => !process.env[key]);
-if (missingEnv.length > 0) {
-  console.error(`Missing required env vars: ${missingEnv.join(", ")}`);
-  process.exit(1);
+function parseAccountNames() {
+  return (process.env.ACCOUNTS ?? "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
 }
 
-const oauth2Client = new google.auth.OAuth2(
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET,
-  "http://localhost",
-);
+function getAccountEnv(accountName, key, fallbackToGlobal = false) {
+  const accountValue = process.env[`${accountName}_${key}`];
+  if (accountValue) return accountValue;
+  return fallbackToGlobal ? process.env[key] : undefined;
+}
 
-oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+function buildSingleAccount() {
+  const requiredEnv = [
+    "DISCORD_WEBHOOK_URL",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "GOOGLE_REFRESH_TOKEN",
+  ];
 
-const gmail = google.gmail({ version: "v1", auth: oauth2Client });
-let hasSentAuthErrorNotification = false;
-let isPolling = false;
+  const missingEnv = requiredEnv.filter((key) => !process.env[key]);
+  if (missingEnv.length > 0) {
+    console.error(`Missing required env vars: ${missingEnv.join(", ")}`);
+    process.exit(1);
+  }
+
+  return {
+    name: "default",
+    discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL,
+    googleClientId: process.env.GOOGLE_CLIENT_ID,
+    googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    googleRefreshToken: process.env.GOOGLE_REFRESH_TOKEN,
+    googleUserId: process.env.GOOGLE_USER_ID ?? "me",
+    gmailQuery: process.env.GMAIL_QUERY ?? "is:unread newer_than:10m",
+    hasSentAuthErrorNotification: false,
+  };
+}
+
+function buildNamedAccount(accountName) {
+  const account = {
+    name: accountName,
+    discordWebhookUrl: getAccountEnv(accountName, "DISCORD_WEBHOOK_URL"),
+    googleClientId: getAccountEnv(accountName, "GOOGLE_CLIENT_ID", true),
+    googleClientSecret: getAccountEnv(accountName, "GOOGLE_CLIENT_SECRET", true),
+    googleRefreshToken: getAccountEnv(accountName, "GOOGLE_REFRESH_TOKEN"),
+    googleUserId: getAccountEnv(accountName, "GOOGLE_USER_ID") ?? "me",
+    gmailQuery:
+      getAccountEnv(accountName, "GMAIL_QUERY") ?? "is:unread newer_than:10m",
+    hasSentAuthErrorNotification: false,
+  };
+
+  const requiredKeys = [
+    "DISCORD_WEBHOOK_URL",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "GOOGLE_REFRESH_TOKEN",
+  ];
+  const missing = requiredKeys.filter((key) => {
+    if (key === "GOOGLE_CLIENT_ID" || key === "GOOGLE_CLIENT_SECRET") {
+      return !getAccountEnv(accountName, key, true);
+    }
+    return !getAccountEnv(accountName, key);
+  });
+
+  if (missing.length > 0) {
+    console.error(
+      `Missing required env vars for ${accountName}: ${missing
+        .map((key) => `${accountName}_${key}`)
+        .join(", ")}`,
+    );
+    process.exit(1);
+  }
+
+  return account;
+}
+
+function createAccountRuntime(account) {
+  const oauth2Client = new google.auth.OAuth2(
+    account.googleClientId,
+    account.googleClientSecret,
+    "http://localhost",
+  );
+
+  oauth2Client.setCredentials({ refresh_token: account.googleRefreshToken });
+
+  return {
+    ...account,
+    gmail: google.gmail({ version: "v1", auth: oauth2Client }),
+  };
+}
+
+function buildAccounts() {
+  const accountNames = parseAccountNames();
+  const accounts =
+    accountNames.length > 0
+      ? accountNames.map(buildNamedAccount)
+      : [buildSingleAccount()];
+
+  return accounts.map(createAccountRuntime);
+}
+
+const accounts = buildAccounts();
 
 function formatError(err) {
   const parts = [];
@@ -86,7 +161,7 @@ function truncateForDiscord(text, max = 1500) {
     : normalized;
 }
 
-async function sendDiscordWebhook(contentOrPayload) {
+async function sendDiscordWebhook(account, contentOrPayload) {
   const payload =
     typeof contentOrPayload === "string"
       ? { content: contentOrPayload }
@@ -94,7 +169,7 @@ async function sendDiscordWebhook(contentOrPayload) {
   let res;
 
   try {
-    res = await fetch(DISCORD_WEBHOOK_URL, {
+    res = await fetch(account.discordWebhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -148,50 +223,53 @@ function isInvalidGrantError(err) {
   return errText.includes("invalid_grant") || causeText.includes("invalid_grant");
 }
 
-async function notifyOAuthReauthNeededOnce(err) {
-  if (hasSentAuthErrorNotification) return;
-  hasSentAuthErrorNotification = true;
+async function notifyOAuthReauthNeededOnce(account, err) {
+  if (account.hasSentAuthErrorNotification) return;
+  account.hasSentAuthErrorNotification = true;
 
   const message = [
     "<@&1508497554986242110>",
     "⚠️ **gmail_to_discord auth error**",
+    `Account: ${account.name}`,
     "Google OAuth refresh failed (`invalid_grant`).",
-    "Please run `npm run token` and update `GOOGLE_REFRESH_TOKEN` in `.env`.",
+    account.name === "default"
+      ? "Please run `npm run token` and update `GOOGLE_REFRESH_TOKEN` in `.env`."
+      : `Please run \`npm run token -- --account ${account.name}\` and update \`${account.name}_GOOGLE_REFRESH_TOKEN\` in \`.env\`.`,
     "",
     `Time: ${new Date().toISOString()}`,
     `Detail: ${String(err?.message ?? "unknown error")}`,
   ].join("\n");
 
   try {
-    await sendDiscordWebhook(message);
+    await sendDiscordWebhook(account, message);
   } catch (notifyErr) {
     console.error("Failed to send auth error notification to Discord:", notifyErr?.message ?? notifyErr);
   }
 }
 
-async function processUnreadMessages() {
-  const listRes = await gmail.users.messages.list({
-    userId: GOOGLE_USER_ID,
-    q: GMAIL_QUERY,
+async function processUnreadMessages(account) {
+  const listRes = await account.gmail.users.messages.list({
+    userId: account.googleUserId,
+    q: account.gmailQuery,
     maxResults: 20,
   });
 
   const messages = listRes.data.messages ?? [];
   if (messages.length === 0) {
-    console.log(`[${new Date().toISOString()}] No unread messages.`);
+    console.log(`[${new Date().toISOString()}] [${account.name}] No unread messages.`);
     return;
   }
 
   console.log(
-    `[${new Date().toISOString()}] Found ${messages.length} unread message(s).`,
+    `[${new Date().toISOString()}] [${account.name}] Found ${messages.length} unread message(s).`,
   );
 
   for (const msg of messages) {
     try {
       console.log(`Processing message: ${msg.id}`);
 
-      const detailRes = await gmail.users.messages.get({
-        userId: GOOGLE_USER_ID,
+      const detailRes = await account.gmail.users.messages.get({
+        userId: account.googleUserId,
         id: msg.id,
         format: "full",
       });
@@ -214,15 +292,15 @@ async function processUnreadMessages() {
         excerpt,
       ].join("\n");
 
-      await sendDiscordWebhook({
+      await sendDiscordWebhook(account, {
         username: truncate(buildDiscordUsername(fromInfo), 80),
         avatar_url: buildAvatarUrlFromEmail(fromInfo.email),
         content,
       });
       console.log(`Discord notified: ${msg.id}`);
 
-      await gmail.users.messages.modify({
-        userId: GOOGLE_USER_ID,
+      await account.gmail.users.messages.modify({
+        userId: account.googleUserId,
         id: msg.id,
         requestBody: {
           removeLabelIds: ["UNREAD"],
@@ -231,8 +309,19 @@ async function processUnreadMessages() {
 
       console.log(`Notified and marked as read: ${msg.id}`);
     } catch (err) {
-      console.error(`Failed to process message ${msg.id}: ${formatError(err)}`);
+      console.error(`[${account.name}] Failed to process message ${msg.id}: ${formatError(err)}`);
     }
+  }
+}
+
+async function pollAccount(account) {
+  try {
+    await processUnreadMessages(account);
+  } catch (err) {
+    if (isInvalidGrantError(err)) {
+      await notifyOAuthReauthNeededOnce(account, err);
+    }
+    console.error(`[${account.name}] Polling error:`, formatError(err));
   }
 }
 
@@ -246,7 +335,7 @@ async function main() {
     throw new Error("POLL_INTERVAL_SECONDS must be a positive number.");
   }
 
-  await processUnreadMessages();
+  await Promise.all(accounts.map((account) => pollAccount(account)));
 
   setInterval(async () => {
     if (isPolling) {
@@ -256,11 +345,8 @@ async function main() {
 
     isPolling = true;
     try {
-      await processUnreadMessages();
+      await Promise.all(accounts.map((account) => pollAccount(account)));
     } catch (err) {
-      if (isInvalidGrantError(err)) {
-        await notifyOAuthReauthNeededOnce(err);
-      }
       console.error("Polling error:", formatError(err));
     } finally {
       isPolling = false;
@@ -268,7 +354,9 @@ async function main() {
   }, intervalMs);
 
   console.log(
-    `Watcher started. Query=\"${GMAIL_QUERY}\" interval=${intervalSeconds}s`,
+    `Watcher started. accounts=${accounts
+      .map((account) => `${account.name}(query=\"${account.gmailQuery}\")`)
+      .join(", ")} interval=${intervalSeconds}s`,
   );
 }
 
@@ -279,13 +367,15 @@ async function run() {
     const isInvalidGrant = isInvalidGrantError(err);
 
     if (isInvalidGrant) {
-      await notifyOAuthReauthNeededOnce(err);
+      await Promise.all(
+        accounts.map((account) => notifyOAuthReauthNeededOnce(account, err)),
+      );
       console.error("");
       console.error("OAuth token refresh failed: invalid_grant");
       console.error("Please verify:");
       console.error("1) GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET match the same OAuth client used to issue the refresh token.");
       console.error("2) GOOGLE_REFRESH_TOKEN is valid (not revoked / not from another client).");
-      console.error("3) OAuth consent screen is published, or your Google account is added as a test user.");
+      console.error("3) OAuth consent screen is In production. External + Testing refresh tokens expire in about 7 days for Gmail scopes.");
       console.error("4) .env values do not include extra spaces or quotes.");
       console.error("Run `npm run token` to issue a new refresh token if needed.");
       console.error("");
